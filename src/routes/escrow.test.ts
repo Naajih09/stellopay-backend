@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import express from "express";
-import { escrowRouter } from "./escrow.js";
+import { escrowRouter, computeAgreementBalance, checkAgreementEmployerAuth, prepareTransactionContext } from "./escrow.js";
 import { db, schema } from "../db/index.js";
 
 const mockEscrow = {
@@ -208,4 +208,56 @@ describe("escrow routes", () => {
       expect(res.body).toEqual({ error: "Unauthorized" });
     });
   });
+
+  describe("Helper Functions", () => {
+    describe("computeAgreementBalance", () => {
+      it("calculates balance correctly from funded and released events", () => {
+        const events = [
+          { eventType: "Funded", amount: "1000" },
+          { eventType: "Released", amount: "200" },
+          { eventType: "Refunded", amount: "100" },
+        ];
+        const balance = computeAgreementBalance(events);
+        expect(balance).toBe(700n);
+      });
+
+      it("clamps negative balance to zero", () => {
+        const events = [
+          { eventType: "Funded", amount: "100" },
+          { eventType: "Released", amount: "200" },
+        ];
+        const balance = computeAgreementBalance(events);
+        expect(balance).toBe(0n);
+      });
+    });
+
+    describe("checkAgreementEmployerAuth", () => {
+      it("returns true when wallet address matches employer", async () => {
+        mockEscrow.get_agreement_employer.mockResolvedValue("0xabc");
+        const isAuth = await checkAgreementEmployerAuth("0x123", 1n, "0xABC");
+        expect(isAuth).toBe(true);
+      });
+
+      it("returns false when wallet address does not match employer", async () => {
+        mockEscrow.get_agreement_employer.mockResolvedValue("0xother");
+        const isAuth = await checkAgreementEmployerAuth("0x123", 1n, "0xabc");
+        expect(isAuth).toBe(false);
+      });
+    });
+
+    describe("prepareTransactionContext", () => {
+      it("fetches nonce and chainId concurrently", async () => {
+        const { provider } = await import("../starknet/client.js");
+        (provider.getNonceForAddress as any).mockResolvedValue("0x1");
+        (provider.getChainId as any).mockResolvedValue("0x534e5f4d41494e");
+
+        const result = await prepareTransactionContext("0xabc");
+        expect(result).toEqual({
+          nonce: "0x1",
+          chain_id: "0x534e5f4d41494e",
+        });
+      });
+    });
+  });
 });
+

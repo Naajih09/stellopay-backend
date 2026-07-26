@@ -39,3 +39,16 @@ Prepares a transaction payload to refund the remaining escrow balance back to th
 - Expects a valid session (`wallet_address` and `session_token`).
 - **Authorization Check:** Verifies that the requesting `wallet_address` is the authorized employer for the given `agreement_id`, similarly preventing unauthorized parties from initiating a refund.
 - Returns the calldata required for the `refund_remaining` entrypoint.
+
+## Helper Functions
+
+To reduce repeated computation and I/O, the following helper functions are exported for use within the module and tests:
+
+### `computeAgreementBalance(events)`
+Replays an array of escrow events (`Funded`, `Released`, `Refunded`) to calculate the current balance. Clamps any negative balance to `0n`.
+
+### `checkAgreementEmployerAuth(address, agreement_id, wallet_address)`
+Verifies that the given `wallet_address` is the authorized employer for the agreement by querying the Starknet contract.
+
+### `prepareTransactionContext(wallet_address)`
+Fetches the `nonce` and `chain_id` concurrently for a given `wallet_address` to optimize network I/O latency when preparing transactions.
