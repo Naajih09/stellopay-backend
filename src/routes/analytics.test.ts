@@ -183,7 +183,11 @@ describe("analytics telemetry and error logs", () => {
     expect(infoSpy).toHaveBeenCalled();
     const parsed = infoSpy.mock.calls
       .map((call) => {
-        try { return JSON.parse(call[0] as string); } catch { return null; }
+        try {
+          return JSON.parse(call[0] as string);
+        } catch {
+          return null;
+        }
       })
       .find((l) => l?.operation === "analytics_monthly_rollup");
 
@@ -209,7 +213,11 @@ describe("analytics telemetry and error logs", () => {
     expect(errorSpy).toHaveBeenCalled();
     const parsed = errorSpy.mock.calls
       .map((call) => {
-        try { return JSON.parse(call[0] as string); } catch { return null; }
+        try {
+          return JSON.parse(call[0] as string);
+        } catch {
+          return null;
+        }
       })
       .find((l) => l?.operation === "analytics_monthly_rollup");
 
@@ -243,5 +251,79 @@ describe("analytics telemetry and error logs", () => {
     // A Zod parse failure before any DB call still hits our catch block, so
     // we verify the log is written but no DB queries ran.
     expect(queryState.eqValues).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Performance: parallel query execution
+// ---------------------------------------------------------------------------
+describe("analytics parallel queries", () => {
+  it("fires all three DB queries (payments, escrow, agreements) through a single select chain", async () => {
+    queryState.rows.payments = [{ month: 3, amount: "1000000" }];
+    queryState.rows.escrowEvents = [{ month: 4, amount: "500000", eventType: "Funded" }];
+    queryState.rows.agreementEvents = [{ month: 6, agreementId: "1" }];
+
+    await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(200);
+
+    // The mock db.select is called once per Promise.all entry, so 3 calls
+    // total — one for each independent query.
+    expect(dbMock.select).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Display conversion edge cases
+// ---------------------------------------------------------------------------
+describe("analytics display conversion", () => {
+  it("returns all-zero months with zero total when there is no activity", async () => {
+    const res = await request(makeApp()).get(`/api/v1/analytics/abc?year=2026`).expect(200);
+    expect(res.body.data).toHaveLength(12);
+    for (const entry of res.body.data) {
+      expect(entry.views).toBe(0);
+    }
+    expect(res.body.total).toBe(0);
+  });
+
+  it("handles large BigInt amounts without precision loss", async () => {
+    // 999999999999 base units = 999999.999999 display (6 decimals)
+    queryState.rows.payments = [{ month: 1, amount: "999999999999" }];
+    const res = await request(makeApp()).get(`/api/v1/analytics/abc?year=2026`).expect(200);
+    expect(res.body.data[0].views).toBeCloseTo(999999.999999, 6);
+    expect(res.body.total).toBeCloseTo(999999.999999, 6);
+  });
+
+  it("handles negative totals correctly", async () => {
+    // Funding only → negative
+    queryState.rows.escrowEvents = [{ month: 2, amount: "5000000", eventType: "Funded" }];
+    const res = await request(makeApp()).get(`/api/v1/analytics/abc?year=2026`).expect(200);
+    expect(res.body.total).toBe(-5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DB failure paths
+// ---------------------------------------------------------------------------
+describe("analytics DB failure", () => {
+  it("surfaces a database failure through the error handler", async () => {
+    dbMock.select.mockImplementationOnce(() => {
+      throw new Error("db unavailable");
+    });
+
+    const res = await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(500);
+    expect(res.body.error).toBe("db unavailable");
+  });
+
+  it("surfaces a query rejection through the error handler", async () => {
+    dbMock.select.mockImplementationOnce(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => Promise.reject(new Error("connection timeout"))),
+        innerJoin: vi.fn(() => ({
+          where: vi.fn(() => Promise.reject(new Error("connection timeout"))),
+        })),
+      })),
+    }));
+
+    const res = await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(500);
+    expect(res.body.error).toBe("connection timeout");
   });
 });
