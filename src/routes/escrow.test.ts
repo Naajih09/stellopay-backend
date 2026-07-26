@@ -147,6 +147,7 @@ describe("escrow routes", () => {
       (requireSession as any).mockResolvedValue(true);
 
       mockEscrow.populate.mockReturnValue({ contractAddress: "0x123", entrypoint: "release", calldata: [] });
+      mockEscrow.get_agreement_employer.mockResolvedValue("0xabc");
       const { provider } = await import("../starknet/client.js");
       (provider.getNonceForAddress as any).mockResolvedValue("0x1");
       (provider.getChainId as any).mockResolvedValue("0x534e5f4d41494e"); // SN_MAIN
@@ -186,6 +187,25 @@ describe("escrow routes", () => {
         .expect(401);
 
       expect(res.body).toEqual({ error: "Invalid session" });
+    });
+    it("returns 403 when wallet_address is not the employer", async () => {
+      const { requireSession } = await import("../auth/session.js");
+      (requireSession as any).mockResolvedValue(true);
+
+      mockEscrow.get_agreement_employer.mockResolvedValue("0xother");
+
+      const res = await request(makeApp())
+        .post("/api/v1/prepare/escrow/0x123/release")
+        .send({
+          wallet_address: "0xabc",
+          session_token: "token123456",
+          agreement_id: 1,
+          to: "0xdef",
+          amount: "100",
+        })
+        .expect(403);
+
+      expect(res.body).toEqual({ error: "Unauthorized" });
     });
   });
 });

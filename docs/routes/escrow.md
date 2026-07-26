@@ -23,6 +23,7 @@ Prepares a transaction payload to release funds from the escrow.
 
 **Behavior:**
 - Expects a valid session (`wallet_address` and `session_token`).
+- **Authorization Check:** Verifies that the requesting `wallet_address` is the authorized employer for the given `agreement_id`. If they do not match, the request fails with a `403 Unauthorized` error.
 - Returns the calldata required for the `release` entrypoint on the Starknet contract.
 - Includes the `nonce` and `chain_id` necessary to sign the payload client-side.
 
@@ -30,3 +31,11 @@ Prepares a transaction payload to release funds from the escrow.
 - Uses the standard session verification shared across routes.
 - The `ReleaseBody` requires `agreement_id` (positive bigint), `to` (string min 3 chars), and `amount` (string min 1 char) for proper validation.
 - Unchanged shape ensures existing clients parsing `call`, `nonce`, `chain_id` do not break.
+
+### `POST /prepare/escrow/:address/refund_remaining`
+Prepares a transaction payload to refund the remaining escrow balance back to the employer.
+
+**Behavior:**
+- Expects a valid session (`wallet_address` and `session_token`).
+- **Authorization Check:** Verifies that the requesting `wallet_address` is the authorized employer for the given `agreement_id`, similarly preventing unauthorized parties from initiating a refund.
+- Returns the calldata required for the `refund_remaining` entrypoint.

@@ -203,6 +203,12 @@ escrowRouter.post("/prepare/escrow/:address/release", async (req, res, next) => 
     }
 
     const c = escrowContract(address);
+    const employer = await c.get_agreement_employer(body.agreement_id);
+    if (employer.toLowerCase() !== body.wallet_address.toLowerCase()) {
+      res.status(403).json({ error: "Unauthorized" });
+      return;
+    }
+
     const call = c.populate("release", [
       body.agreement_id.toString(),
       body.to,
@@ -226,6 +232,12 @@ escrowRouter.post("/prepare/escrow/:address/refund_remaining", async (req, res, 
     }
 
     const c = escrowContract(address);
+    const employer = await c.get_agreement_employer(body.agreement_id);
+    if (employer.toLowerCase() !== body.wallet_address.toLowerCase()) {
+      res.status(403).json({ error: "Unauthorized" });
+      return;
+    }
+
     const call = c.populate("refund_remaining", [body.agreement_id.toString()]);
     const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
     const chainId = await provider.getChainId();
