@@ -103,20 +103,11 @@ event name can be decoded from the on-chain receipt.
   Combined with the deterministic ordering above, this guarantees forward
   progress across calls.
 
-### Known limitations / out of scope
+### Quarantine paths and retry budgets
 
-There is **no persistent retry-count or quarantine state** for events that
-repeatedly fail to update in `/status-changes` (statuses `no_receipt`,
-`event_not_found`, or `error`). Because such events never have their
-`eventType` changed away from `AgreementStatusChange`, they remain
-eligible for reprocessing on **every** subsequent call unless the caller
-manually advances `fromBlock` past them.
+Events that repeatedly fail to update in `/status-changes` (e.g. `no_receipt`, `event_not_found`, or `error`) could cause endless reprocessing loops since their `eventType` remains `AgreementStatusChange`. 
 
-Adding real retry-count/quarantine tracking would require a schema
-migration (a new column on `agreement_events`, e.g. `retry_count` or
-`quarantined_at`) and is intentionally **out of scope** for this change.
-The deterministic ordering and `hasMore` signal above are a lighter-weight
-fix that stabilizes the pagination contract without touching the schema;
-operators who need to skip permanently-stuck rows should advance
-`fromBlock` past them manually until quarantine tracking is added in a
-follow-up.
+To prevent this, the route implements an **in-memory retry budget and quarantine path**:
+- An event can fail up to `MAX_RETRIES` (3) times.
+- On the 3rd failure, the event is marked `status: "quarantined"` and skipped in all subsequent calls.
+- Because this state is kept in memory (to avoid a schema migration), quarantines are reset if the server restarts. This provides a lightweight protection against spinning on permanently stuck rows while remaining backward compatible.

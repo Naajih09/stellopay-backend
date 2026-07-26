@@ -1,7 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import express from "express";
-import { reprocessEventsRouter } from "./reprocess-events.js";
+import { reprocessEventsRouter, statusChangeQuarantine, statusChangeRetryCounts, MAX_RETRIES } from "./reprocess-events.js";
 import { eventsRouter } from "./events.js";
 import { db } from "../db/index.js";
 
@@ -94,6 +94,10 @@ describe("Reprocess Events Routes", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetTransactionReceipt.mockReset();
+    mockParseEvent.mockReset();
+    statusChangeQuarantine.clear();
+    statusChangeRetryCounts.clear();
     global.fetch = fetchMock as any;
 
     // Set up test express app
@@ -130,6 +134,22 @@ describe("Reprocess Events Routes", () => {
         ],
       };
       mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+      mockParseEvent.mockImplementation((event: any) => {
+        if (event?.shouldFail) {
+          throw new Error("Failed to parse event");
+        }
+        return {
+          name: "AgreementCreated",
+          data: {
+            agreement_id: "123",
+            employer: "0x123",
+            contributor: "0x456",
+            token: "0x789",
+            mode: 0,
+            payment_type: 1,
+          },
+        };
+      });
 
       const txHash = "0x1234567890abcdef";
       const res = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(200);
@@ -192,6 +212,10 @@ describe("Reprocess Events Routes", () => {
         ],
       };
       mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+      mockParseEvent.mockImplementation(() => ({
+        name: "AgreementCreated",
+        data: { agreement_id: "123" }
+      }));
 
       const txHash = "0x1234567890abcdef";
 
@@ -221,6 +245,7 @@ describe("Reprocess Events Routes", () => {
         ],
       };
       mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+      mockParseEvent.mockImplementation(() => ({ name: "test", data: {} }));
 
       const txHash = "0x1234567890abcdef";
       const endpoint = `/api/v1/reprocess-events/tx/${txHash}`;
@@ -333,6 +358,64 @@ describe("Reprocess Events Routes", () => {
 
       selectMock.mockRestore();
     });
+
+      it("should apply retry budget and quarantine path for failing events", async () => {
+        const mockEvents = [
+          {
+            id: "event_quarantine_test",
+            transactionHash: "0x123",
+            eventIndex: 0,
+            contractAddress: "0xwork",
+            eventType: "AgreementStatusChange",
+          },
+        ];
+  
+        const selectMock = vi.spyOn(db, "select").mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue(mockEvents),
+              }),
+            }),
+          }),
+        } as any);
+  
+        // Always fail with no receipt
+        mockGetTransactionReceipt.mockResolvedValue(null);
+  
+        // First attempt -> error/no_receipt
+        let res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+        expect(res.body.results[0]).toEqual({
+          eventId: "event_quarantine_test",
+          status: "no_receipt",
+        });
+  
+        // Second attempt -> error/no_receipt
+        res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+        expect(res.body.results[0]).toEqual({
+          eventId: "event_quarantine_test",
+          status: "no_receipt",
+        });
+  
+        // Third attempt (MAX_RETRIES) -> quarantined
+        res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+        expect(res.body.results[0]).toEqual({
+          eventId: "event_quarantine_test",
+          status: "quarantined",
+          reason: "no_receipt"
+        });
+  
+        // Fourth attempt -> immediately quarantined without RPC call
+        mockGetTransactionReceipt.mockClear();
+        res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+        expect(res.body.results[0]).toEqual({
+          eventId: "event_quarantine_test",
+          status: "quarantined"
+        });
+        expect(mockGetTransactionReceipt).not.toHaveBeenCalled();
+  
+        selectMock.mockRestore();
+      });
 
     it("should decode using fallback selector map when parseEvent throws", async () => {
       const mockEvents = [

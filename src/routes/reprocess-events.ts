@@ -22,6 +22,16 @@ const StatusChangesQuerySchema = z.object({
   toBlock: z.coerce.number().int().positive().optional(),
 });
 
+/**
+ * In-memory retry and quarantine tracking for /status-changes.
+ * Events that fail more than MAX_RETRIES times are quarantined and skipped
+ * on subsequent calls to avoid endless spinning on unparseable events.
+ * This is an in-memory substitute for a persistent schema migration.
+ */
+export const MAX_RETRIES = 3;
+export const statusChangeRetryCounts = new Map<string, number>();
+export const statusChangeQuarantine = new Set<string>();
+
 // Load contract ABIs
 let workAgreementAbi: any[] | null = null;
 let payrollEscrowAbi: any[] | null = null;
@@ -265,6 +275,12 @@ reprocessEventsRouter.post(
       const processedKeys = new Set<string>();
 
       for (const event of statusChangeEvents) {
+        // Quarantine check: skip if event has failed too many times
+        if (statusChangeQuarantine.has(event.id)) {
+          results.push({ eventId: event.id, status: "quarantined" });
+          continue;
+        }
+
         // Dedup on transaction_hash + event_index — skip if already seen in this request
         const dedupKey = `${event.transactionHash}_${event.eventIndex}`;
         if (processedKeys.has(dedupKey)) {
@@ -273,18 +289,30 @@ reprocessEventsRouter.post(
         }
         processedKeys.add(dedupKey);
 
+        const handleFailure = (status: string, errorMsg?: string) => {
+          const attempts = (statusChangeRetryCounts.get(event.id) || 0) + 1;
+          if (attempts >= MAX_RETRIES) {
+            statusChangeQuarantine.add(event.id);
+            statusChangeRetryCounts.delete(event.id);
+            results.push({ eventId: event.id, status: "quarantined", reason: status, ...(errorMsg ? { error: errorMsg } : {}) });
+          } else {
+            statusChangeRetryCounts.set(event.id, attempts);
+            results.push({ eventId: event.id, status, ...(errorMsg ? { error: errorMsg } : {}) });
+          }
+        };
+
         try {
           // Get transaction receipt to decode event
           const receipt = await provider.getTransactionReceipt(event.transactionHash);
           if (!receipt || !("events" in receipt && receipt.events)) {
-            results.push({ eventId: event.id, status: "no_receipt" });
+            handleFailure("no_receipt");
             continue;
           }
 
           // Find the event in the receipt
           const receiptEvent = receipt.events[event.eventIndex];
           if (!receiptEvent) {
-            results.push({ eventId: event.id, status: "event_not_found" });
+            handleFailure("event_not_found");
             continue;
           }
 
@@ -355,6 +383,7 @@ reprocessEventsRouter.post(
               .set({ eventType })
               .where(eq(schema.agreementEvents.id, event.id));
 
+            statusChangeRetryCounts.delete(event.id);
             updated++;
             results.push({
               eventId: event.id,
@@ -363,10 +392,10 @@ reprocessEventsRouter.post(
               newType: eventType,
             });
           } else {
-            results.push({ eventId: event.id, status: "no_change", eventType });
+            handleFailure("no_change");
           }
         } catch (e) {
-          results.push({ eventId: event.id, status: "error", error: String(e) });
+          handleFailure("error", String(e));
         }
       }
 
