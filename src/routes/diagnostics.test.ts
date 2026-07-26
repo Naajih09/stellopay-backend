@@ -266,3 +266,57 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.status).toBe(500);
   });
 });
+
+describe("GET /diagnostics/events – pagination and batching", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.execute).mockReset();
+    vi.mocked(requireSession).mockResolvedValue(true);
+    wireDbRows();
+  });
+
+  it("applies default pagination when none is provided", async () => {
+    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+    expect(res.status).toBe(200);
+
+    // The query execution should use LIMIT 20 OFFSET 0
+    const executeCalls = vi.mocked(db.execute).mock.calls;
+    const lastCallSql = executeCalls[4][0] as { strings: string[], values: any[] };
+    expect(lastCallSql.strings.join("")).toContain("LIMIT");
+    expect(lastCallSql.values).toEqual(expect.arrayContaining([20, 0]));
+  });
+
+  it("parses and applies custom limit and offset", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=50&offset=10")
+      .set(authHeaders(ADMIN));
+    expect(res.status).toBe(200);
+
+    const executeCalls = vi.mocked(db.execute).mock.calls;
+    const lastCallSql = executeCalls[4][0] as { strings: string[], values: any[] };
+    expect(lastCallSql.values).toEqual(expect.arrayContaining([50, 10]));
+  });
+
+  it("caps limit to 100 to prevent unbounded queries", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=5000&offset=0")
+      .set(authHeaders(ADMIN));
+    expect(res.status).toBe(200);
+
+    const executeCalls = vi.mocked(db.execute).mock.calls;
+    const lastCallSql = executeCalls[4][0] as { strings: string[], values: any[] };
+    expect(lastCallSql.values).toEqual(expect.arrayContaining([100, 0]));
+  });
+
+  it("ignores negative limits and limits that are not numbers, reverting to default", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=-5&offset=invalid")
+      .set(authHeaders(ADMIN));
+    expect(res.status).toBe(200);
+
+    const executeCalls = vi.mocked(db.execute).mock.calls;
+    const lastCallSql = executeCalls[4][0] as { strings: string[], values: any[] };
+    expect(lastCallSql.values).toEqual(expect.arrayContaining([20, 0]));
+  });
+});
+

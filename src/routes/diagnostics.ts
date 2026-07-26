@@ -30,7 +30,13 @@ export function redactRecentEvent(row: Record<string, unknown>): {
  * Ensures read queries execute in parallel to minimize latency, eliminate sequential
  * cascade bottlenecks, and guarantee side-effect-free replay safety.
  */
-export async function fetchDiagnosticsData(dbClient = db) {
+export async function fetchDiagnosticsData(
+  dbClient = db,
+  options: { limit?: number; offset?: number } = {}
+) {
+  const limit = options.limit ?? 20;
+  const offset = options.offset ?? 0;
+
   const [
     eventTypeCountsResult,
     escrowEventCountsResult,
@@ -78,7 +84,7 @@ export async function fetchDiagnosticsData(dbClient = db) {
       SELECT event_type, created_at
       FROM agreement_events
       ORDER BY created_at DESC
-      LIMIT 20
+      LIMIT ${limit} OFFSET ${offset}
     `),
   ]);
 
@@ -119,9 +125,15 @@ diagnosticsRouter.get(
   "/diagnostics/events",
   requireAuth,
   requireAdmin,
-  async (_req, res, next) => {
+  async (req, res, next) => {
     try {
-      const data = await fetchDiagnosticsData();
+      const rawLimit = Number(req.query.limit);
+      const rawOffset = Number(req.query.offset);
+
+      const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 20;
+      const offset = Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+
+      const data = await fetchDiagnosticsData(db, { limit, offset });
       res.json(data);
     } catch (e) {
       next(e);
