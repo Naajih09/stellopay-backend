@@ -1,36 +1,88 @@
-import { describe, it, expect, vi } from "vitest";
-import request from "supertest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import express from "express";
-import { billingRouter } from "./billing.js";
+import request from "supertest";
+import { clearBillingIdempotencyStore, withBillingIdempotency } from "./billing";
 
-// Mock env and db
-vi.mock("../config.js", () => ({ env: { BILLING_ENABLED: true } }));
-// ... (Add your standard DB and schema mocks here)
+function makeApp() {
+  const app = express();
+  app.use(express.json());
 
-describe("Billing Math Hardening", () => {
-  it("should return progressPercentage 0 if limit is 0 (Prevent Div by Zero)", async () => {
-    // Mock DB to return limit "0" and used "100"
-    const res = await request(app).get("/api/v1/billing/profiles/prof_1/summary");
-    expect(res.body.data.progressPercentage).toBe(0);
-    expect(res.body.data.remainingAmount).toBe(0);
+  let executionCount = 0;
+
+  app.post(
+    "/billing/test",
+    withBillingIdempotency(async (req, res) => {
+      executionCount += 1;
+      res.status(201).json({ executionCount, body: req.body });
+    }),
+  );
+
+  return { app, getExecutionCount: () => executionCount };
+}
+
+describe("billing idempotency middleware", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+    clearBillingIdempotencyStore();
   });
 
-  it("should cap progressPercentage at 100 if used exceeds limit", async () => {
-    // Mock DB to return limit "100" and used "150"
-    const res = await request(app).get("/api/v1/billing/profiles/prof_1/summary");
-    expect(res.body.data.progressPercentage).toBe(100);
-    expect(res.body.data.remainingAmount).toBe(0);
+  afterEach(() => {
+    vi.useRealTimers();
+    clearBillingIdempotencyStore();
   });
 
-  it("should reject malformed profileId containing special characters", async () => {
-    const res = await request(app).get("/api/v1/billing/profiles/id;DROP TABLE/summary");
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("alphanumeric");
+  it("executes the handler normally when no idempotency key is supplied", async () => {
+    const { app, getExecutionCount } = makeApp();
+
+    const first = await request(app).post("/billing/test").send({ amount: 10 });
+    const second = await request(app).post("/billing/test").send({ amount: 20 });
+
+    expect(first.status).toBe(201);
+    expect(first.body).toEqual({ executionCount: 1, body: { amount: 10 } });
+    expect(second.status).toBe(201);
+    expect(second.body).toEqual({ executionCount: 2, body: { amount: 20 } });
+    expect(getExecutionCount()).toBe(2);
   });
 
-  it("should return 501 if BILLING_ENABLED is false", async () => {
-    vi.mock("../config.js", () => ({ env: { BILLING_ENABLED: false } }));
-    const res = await request(app).get("/api/v1/billing/profiles/prof_1/summary");
-    expect(res.status).toBe(501);
+  it("reuses the original response for the same idempotency key and body", async () => {
+    const { app, getExecutionCount } = makeApp();
+
+    const first = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "key-123")
+      .send({ amount: 10 });
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "key-123")
+      .send({ amount: 10 });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    expect(second.body).toEqual(first.body);
+    expect(getExecutionCount()).toBe(1);
+  });
+
+  it("rejects a repeated idempotency key when the body differs", async () => {
+    const { app, getExecutionCount } = makeApp();
+
+    const first = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "key-456")
+      .send({ amount: 10 });
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "key-456")
+      .send({ amount: 20 });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(409);
+    expect(second.body).toEqual({
+      success: false,
+      error: "Idempotency key already used with a different request body",
+    });
+    expect(getExecutionCount()).toBe(1);
   });
 });
