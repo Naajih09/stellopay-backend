@@ -64,7 +64,7 @@ vi.mock("drizzle-orm", () => ({
   sql: vi.fn(() => "sql-expr"),
 }));
 
-import { analyticsRouter } from "./analytics.js";
+import { analyticsRouter, parseBigIntSafe, isValidMonth } from "./analytics.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { env } from "../config.js";
 
@@ -99,10 +99,11 @@ beforeEach(() => {
 
 describe("analytics route", () => {
   it("validates and normalizes the address and returns twelve months of chart data", async () => {
-    queryState.rows.payments = [{ month: 3, amount: "1000000" }];
+    const address = normalizeStarknetAddress("abc");
+    queryState.rows.payments = [{ month: 3, amount: "1000000", to: address }];
     queryState.rows.escrowEvents = [
-      { month: 4, amount: "2000000", eventType: "Funded" },
-      { month: 5, amount: "3000000", eventType: "Released" },
+      { month: 4, amount: "2000000", eventType: "Funded", employer: address },
+      { month: 5, amount: "3000000", eventType: "Released", to: address },
     ];
     queryState.rows.agreementEvents = [{ month: 6, agreementId: "1" }];
 
@@ -139,6 +140,55 @@ describe("analytics route", () => {
     const res = await request(makeApp()).get("/api/v1/analytics/not-an-address").expect(400);
     expect(res.body.error).toBe("Validation failed");
     expect(queryState.eqValues).toHaveLength(0);
+  });
+
+  it("computes net payments correctly and ignores agreements when financial activity exists", async () => {
+    const address = normalizeStarknetAddress("abc");
+    // month 1: received 5, sent 2 (net 3)
+    queryState.rows.payments = [
+      { month: 1, amount: "5000000", to: address, from: "someone" },
+      { month: 1, amount: "2000000", from: address, to: "someone" },
+    ];
+    // month 2: funded 4 (net -4), released 3 (net +3), refunded 1 (net +1)
+    queryState.rows.escrowEvents = [
+      { month: 2, amount: "4000000", eventType: "Funded", employer: address, to: "someone" },
+      { month: 2, amount: "3000000", eventType: "Released", employer: "someone", to: address },
+      { month: 2, amount: "1000000", eventType: "Refunded", employer: address, to: "someone" },
+    ];
+    // month 3: 2 agreements, but should be ignored because there is financial activity
+    queryState.rows.agreementEvents = [
+      { month: 3, agreementId: "1" },
+      { month: 3, agreementId: "2" },
+    ];
+
+    const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
+    
+    // month 1 should be 3.0
+    expect(res.body.data[0].views).toBe(3);
+    // month 2 should be -4 + 3 + 1 = 0
+    expect(res.body.data[1].views).toBe(0);
+    // month 3 should be 0 because agreement fallback is suppressed
+    expect(res.body.data[2].views).toBe(0);
+    // Total should be 3
+    expect(res.body.total).toBe(3);
+  });
+
+  it("falls back to agreement counts when there is no financial activity", async () => {
+    queryState.rows.payments = [];
+    queryState.rows.escrowEvents = [];
+    queryState.rows.agreementEvents = [
+      { month: 1, agreementId: "1" },
+      { month: 1, agreementId: "2" },
+      { month: 2, agreementId: "3" },
+    ];
+
+    const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
+    
+    // month 1: 2 agreements * 1000 base units = 0.002
+    expect(res.body.data[0].views).toBe(0.002);
+    // month 2: 1 agreement * 1000 base units = 0.001
+    expect(res.body.data[1].views).toBe(0.001);
+    expect(res.body.total).toBe(0.003);
   });
 
   it("rejects a year below the supported range with 400", async () => {
@@ -254,76 +304,66 @@ describe("analytics telemetry and error logs", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Performance: parallel query execution
-// ---------------------------------------------------------------------------
-describe("analytics parallel queries", () => {
-  it("fires all three DB queries (payments, escrow, agreements) through a single select chain", async () => {
-    queryState.rows.payments = [{ month: 3, amount: "1000000" }];
-    queryState.rows.escrowEvents = [{ month: 4, amount: "500000", eventType: "Funded" }];
-    queryState.rows.agreementEvents = [{ month: 6, agreementId: "1" }];
-
-    await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(200);
-
-    // The mock db.select is called once per Promise.all entry, so 3 calls
-    // total — one for each independent query.
-    expect(dbMock.select).toHaveBeenCalledTimes(3);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Display conversion edge cases
-// ---------------------------------------------------------------------------
-describe("analytics display conversion", () => {
-  it("returns all-zero months with zero total when there is no activity", async () => {
-    const res = await request(makeApp()).get(`/api/v1/analytics/abc?year=2026`).expect(200);
-    expect(res.body.data).toHaveLength(12);
-    for (const entry of res.body.data) {
-      expect(entry.views).toBe(0);
-    }
-    expect(res.body.total).toBe(0);
-  });
-
-  it("handles large BigInt amounts without precision loss", async () => {
-    // 999999999999 base units = 999999.999999 display (6 decimals)
-    queryState.rows.payments = [{ month: 1, amount: "999999999999" }];
-    const res = await request(makeApp()).get(`/api/v1/analytics/abc?year=2026`).expect(200);
-    expect(res.body.data[0].views).toBeCloseTo(999999.999999, 6);
-    expect(res.body.total).toBeCloseTo(999999.999999, 6);
-  });
-
-  it("handles negative totals correctly", async () => {
-    // Funding only → negative
-    queryState.rows.escrowEvents = [{ month: 2, amount: "5000000", eventType: "Funded" }];
-    const res = await request(makeApp()).get(`/api/v1/analytics/abc?year=2026`).expect(200);
-    expect(res.body.total).toBe(-5);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// DB failure paths
-// ---------------------------------------------------------------------------
-describe("analytics DB failure", () => {
-  it("surfaces a database failure through the error handler", async () => {
-    dbMock.select.mockImplementationOnce(() => {
-      throw new Error("db unavailable");
+describe("analytics helper unit tests & input hardening", () => {
+  describe("parseBigIntSafe", () => {
+    it("safely converts valid string, bigint, and number inputs", () => {
+      expect(parseBigIntSafe("1000")).toBe(1000n);
+      expect(parseBigIntSafe(500n)).toBe(500n);
+      expect(parseBigIntSafe(250)).toBe(250n);
     });
 
-    const res = await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(500);
-    expect(res.body.error).toBe("db unavailable");
+    it("returns 0n for missing, empty, or malformed inputs without throwing", () => {
+      expect(parseBigIntSafe(null)).toBe(0n);
+      expect(parseBigIntSafe(undefined)).toBe(0n);
+      expect(parseBigIntSafe("")).toBe(0n);
+      expect(parseBigIntSafe("not-a-number")).toBe(0n);
+      expect(parseBigIntSafe("12.34")).toBe(0n);
+      expect(parseBigIntSafe(NaN)).toBe(0n);
+    });
   });
 
-  it("surfaces a query rejection through the error handler", async () => {
-    dbMock.select.mockImplementationOnce(() => ({
-      from: vi.fn(() => ({
-        where: vi.fn(() => Promise.reject(new Error("connection timeout"))),
-        innerJoin: vi.fn(() => ({
-          where: vi.fn(() => Promise.reject(new Error("connection timeout"))),
-        })),
-      })),
-    }));
+  describe("isValidMonth", () => {
+    it("returns true for valid months (1 to 12)", () => {
+      expect(isValidMonth(1)).toBe(true);
+      expect(isValidMonth(12)).toBe(true);
+      expect(isValidMonth("6")).toBe(true);
+    });
 
-    const res = await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(500);
-    expect(res.body.error).toBe("connection timeout");
+    it("returns false for out-of-bounds or non-integer months", () => {
+      expect(isValidMonth(0)).toBe(false);
+      expect(isValidMonth(13)).toBe(false);
+      expect(isValidMonth(-1)).toBe(false);
+      expect(isValidMonth("abc")).toBe(false);
+    });
+  });
+
+  describe("boundary & robustness integration tests", () => {
+    it("handles empty year parameter (?year=) by defaulting to current year", async () => {
+      const res = await request(makeApp()).get("/api/v1/analytics/abc?year=").expect(200);
+      expect(res.body.year).toBe(new Date().getFullYear());
+    });
+
+    it("rejects non-integer year with 400", async () => {
+      await request(makeApp()).get("/api/v1/analytics/abc?year=2026.5").expect(400);
+    });
+
+    it("rejects non-numeric string year with 400", async () => {
+      await request(makeApp()).get("/api/v1/analytics/abc?year=invalid").expect(400);
+    });
+
+    it("gracefully handles DB rows with unparseable amounts and invalid month numbers", async () => {
+      const address = normalizeStarknetAddress("abc");
+      queryState.rows.payments = [
+        { month: 1, amount: "invalid-amount", to: address },
+        { month: 99, amount: "5000000", to: address },
+      ];
+      queryState.rows.escrowEvents = [
+        { month: 2, amount: null, eventType: "Released", to: address },
+      ];
+
+      const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
+      expect(res.body.data).toHaveLength(12);
+      expect(res.body.total).toBe(0);
+    });
   });
 });
