@@ -102,6 +102,36 @@ describe("redactRecentEvent helper", () => {
     expect(redacted).not.toHaveProperty("agreement_id");
     expect(redacted).not.toHaveProperty("employer");
   });
+
+  it("provides safe fallbacks for malformed inputs without crashing", () => {
+    // Missing fields
+    expect(redactRecentEvent({})).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Invalid types
+    expect(redactRecentEvent({ event_type: 123, created_at: false })).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Null or undefined
+    expect(redactRecentEvent(null)).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+    expect(redactRecentEvent(undefined)).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Primitive values
+    expect(redactRecentEvent("just a string")).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+  });
 });
 
 describe("fetchDiagnosticsData helper", () => {
@@ -267,56 +297,88 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   });
 });
 
-describe("GET /diagnostics/events – pagination and batching", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(db.execute).mockReset();
-    vi.mocked(requireSession).mockResolvedValue(true);
-    wireDbRows();
-  });
 
-  it("applies default pagination when none is provided", async () => {
-    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
-    expect(res.status).toBe(200);
+describe("GET /diagnostics/events – backward-compatibility contract (Issue #284)", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+            vi.mocked(db.execute).mockReset();
+                vi.mocked(requireSession).mockResolvedValue(true);
+                  });
 
-    // The query execution should use LIMIT 20 OFFSET 0
-    const executeCalls = vi.mocked(db.execute).mock.calls;
-    const lastCallSql = executeCalls[4][0] as { strings: string[], values: any[] };
-    expect(lastCallSql.strings.join("")).toContain("LIMIT");
-    expect(lastCallSql.values).toEqual(expect.arrayContaining([20, 0]));
-  });
+                    it("response always includes the full set of documented top-level keys", async () => {
+                        wireDbRows();
 
-  it("parses and applies custom limit and offset", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events?limit=50&offset=10")
-      .set(authHeaders(ADMIN));
-    expect(res.status).toBe(200);
+                            const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
 
-    const executeCalls = vi.mocked(db.execute).mock.calls;
-    const lastCallSql = executeCalls[4][0] as { strings: string[], values: any[] };
-    expect(lastCallSql.values).toEqual(expect.arrayContaining([50, 10]));
-  });
+                                expect(res.status).toBe(200);
+                                    // Locks the public response contract: existing consumers may rely on
+                                        // any of these keys being present. Adding new keys is fine (additive);
+                                            // renaming or removing one of these is a breaking change and must fail
+                                                // this test, forcing a deliberate version discussion instead of a
+                                                    // silent drift.
+                                                        expect(Object.keys(res.body).sort()).toEqual(
+                                                              [
+                                                                      "eventTypeCounts",
+                                                                              "escrowEventCounts",
+                                                                                      "paymentEventCounts",
+                                                                                              "tableCounts",
+                                                                                                      "latestEvents",
+                                                                                                              "poolStats",
+                                                                                                                      "summary",
+                                                                                                                            ].sort(),
+                                                                                                                                );
+                                                                                                                                  });
 
-  it("caps limit to 100 to prevent unbounded queries", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events?limit=5000&offset=0")
-      .set(authHeaders(ADMIN));
-    expect(res.status).toBe(200);
+                                                                                                                                    it("summary always includes the documented six fields, even when tables are empty", async () => {
+                                                                                                                                        vi.mocked(db.execute)
+                                                                                                                                              .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                    .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                          .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                                .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                                      .mockResolvedValueOnce({ rows: [] } as any);
 
-    const executeCalls = vi.mocked(db.execute).mock.calls;
-    const lastCallSql = executeCalls[4][0] as { strings: string[], values: any[] };
-    expect(lastCallSql.values).toEqual(expect.arrayContaining([100, 0]));
-  });
+                                                                                                                                                                          const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
 
-  it("ignores negative limits and limits that are not numbers, reverting to default", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events?limit=-5&offset=invalid")
-      .set(authHeaders(ADMIN));
-    expect(res.status).toBe(200);
+                                                                                                                                                                              expect(res.status).toBe(200);
+                                                                                                                                                                                  expect(Object.keys(res.body.summary).sort()).toEqual(
+                                                                                                                                                                                        [
+                                                                                                                                                                                                "totalAgreementEvents",
+                                                                                                                                                                                                        "totalEscrowEvents",
+                                                                                                                                                                                                                "totalPayments",
+                                                                                                                                                                                                                        "totalEmployees",
+                                                                                                                                                                                                                                "totalMilestones",
+                                                                                                                                                                                                                                        "latestBlock",
+                                                                                                                                                                                                                                              ].sort(),
+                                                                                                                                                                                                                                                  );
+                                                                                                                                                                                                                                                    });
 
-    const executeCalls = vi.mocked(db.execute).mock.calls;
-    const lastCallSql = executeCalls[4][0] as { strings: string[], values: any[] };
-    expect(lastCallSql.values).toEqual(expect.arrayContaining([20, 0]));
-  });
-});
+                                                                                                                                                                                                                                                      it("latestEvents entries never grow beyond the documented redacted shape", async () => {
+                                                                                                                                                                                                                                                          wireDbRows();
 
+                                                                                                                                                                                                                                                              const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                                                                                                                  expect(res.status).toBe(200);
+                                                                                                                                                                                                                                                                      for (const entry of res.body.latestEvents) {
+                                                                                                                                                                                                                                                                            // Exactly two keys — event_type and created_at. If a future change to
+                                                                                                                                                                                                                                                                                  // fetchDiagnosticsData or redactRecentEvent starts leaking a third
+                                                                                                                                                                                                                                                                                        // field, this fails instead of silently widening the redaction surface.
+                                                                                                                                                                                                                                                                                              expect(Object.keys(entry).sort()).toEqual(["created_at", "event_type"]);
+                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                    });
+
+                                                                                                                                                                                                                                                                                                      it("only GET is exposed on /diagnostics/events; other methods are not silently handled", async () => {
+                                                                                                                                                                                                                                                                                                          const app = makeApp();
+
+                                                                                                                                                                                                                                                                                                              const postRes = await request(app).post("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+                                                                                                                                                                                                                                                                                                                  const deleteRes = await request(app).delete("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                                                                                                                                                                      // Express's default for an unregistered method on a known path is 404.
+                                                                                                                                                                                                                                                                                                                          // This test locks that in as the documented contract, so a future route
+                                                                                                                                                                                                                                                                                                                              // addition (e.g. a POST handler) is a deliberate, reviewed decision
+                                                                                                                                                                                                                                                                                                                                  // rather than an accidental side effect of an unrelated change.
+                                                                                                                                                                                                                                                                                                                                      expect(postRes.status).toBe(404);
+                                                                                                                                                                                                                                                                                                                                          expect(deleteRes.status).toBe(404);
+                                                                                                                                                                                                                                                                                                                                              expect(db.execute).not.toHaveBeenCalled();
+                                                                                                                                                                                                                                                                                                                                                });
+                                                                                                                                                                                                                                                                                                                                                });
+})

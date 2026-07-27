@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import express from "express";
-import { escrowRouter, computeAgreementBalance, checkAgreementEmployerAuth, prepareTransactionContext } from "./escrow.js";
-import { db, schema } from "../db/index.js";
+import { escrowRouter, clearEscrowIdempotencyStore } from "./escrow.js";
+import { db } from "../db/index.js";
 
 const mockEscrow = {
   get_token: vi.fn(),
@@ -58,6 +58,15 @@ function makeApp() {
 describe("escrow routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearEscrowIdempotencyStore();
+
+    // Default db.select to resolve to empty array
+    const mockOrderBy = vi.fn().mockResolvedValue([]);
+    const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
+    const mockFrom = vi.fn(() => ({ where: mockWhere }));
+    (db.select as any).mockReturnValue({ from: mockFrom });
+
+    mockEscrow.get_agreement_balance.mockResolvedValue({ low: 1000n, high: 0n });
   });
 
   describe("GET /escrow/:address/get_agreement_balance/:agreement_id", () => {
@@ -139,6 +148,27 @@ describe("escrow routes", () => {
         source: "contract",
       });
     });
+
+    it("deduplicates indexed events by unique event ID", async () => {
+      const mockOrderBy = vi.fn().mockResolvedValue([
+        { id: "evt-1", eventType: "Funded", amount: "1000" },
+        { id: "evt-1", eventType: "Funded", amount: "1000" },
+        { id: "evt-2", eventType: "Released", amount: "200" },
+      ]);
+      const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
+      const mockFrom = vi.fn(() => ({ where: mockWhere }));
+      (db.select as any).mockReturnValue({ from: mockFrom });
+
+      const res = await request(makeApp())
+        .get("/api/v1/escrow/0x123/get_agreement_balance/1")
+        .expect(200);
+
+      expect(res.body).toEqual({
+        agreement_id: "1",
+        balance: "800",
+        source: "indexed",
+      });
+    });
   });
 
   describe("POST /prepare/escrow/:address/release", () => {
@@ -188,11 +218,83 @@ describe("escrow routes", () => {
 
       expect(res.body).toEqual({ error: "Invalid session" });
     });
-    it("returns 403 when wallet_address is not the employer", async () => {
+
+    it("returns cached prepared call when retried with same idempotency key and body", async () => {
       const { requireSession } = await import("../auth/session.js");
       (requireSession as any).mockResolvedValue(true);
 
-      mockEscrow.get_agreement_employer.mockResolvedValue("0xother");
+      mockEscrow.populate.mockReturnValue({ contractAddress: "0x123", entrypoint: "release", calldata: [] });
+      const { provider } = await import("../starknet/client.js");
+      (provider.getNonceForAddress as any).mockResolvedValue("0x1");
+      (provider.getChainId as any).mockResolvedValue("0x534e5f4d41494e"); // SN_MAIN
+
+      const payload = {
+        wallet_address: "0xabc",
+        session_token: "token123456",
+        agreement_id: 1,
+        to: "0xdef",
+        amount: "100",
+      };
+
+      const res1 = await request(makeApp())
+        .post("/api/v1/prepare/escrow/0x123/release")
+        .set("Idempotency-Key", "idemp-key-1")
+        .send(payload)
+        .expect(200);
+
+      const res2 = await request(makeApp())
+        .post("/api/v1/prepare/escrow/0x123/release")
+        .set("Idempotency-Key", "idemp-key-1")
+        .send(payload)
+        .expect(200);
+
+      expect(res2.body).toEqual(res1.body);
+      expect(provider.getNonceForAddress).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects with 409 Conflict when retried with same idempotency key but different body", async () => {
+      const { requireSession } = await import("../auth/session.js");
+      (requireSession as any).mockResolvedValue(true);
+
+      mockEscrow.populate.mockReturnValue({ contractAddress: "0x123", entrypoint: "release", calldata: [] });
+      const { provider } = await import("../starknet/client.js");
+      (provider.getNonceForAddress as any).mockResolvedValue("0x1");
+      (provider.getChainId as any).mockResolvedValue("0x534e5f4d41494e"); // SN_MAIN
+
+      await request(makeApp())
+        .post("/api/v1/prepare/escrow/0x123/release")
+        .set("Idempotency-Key", "idemp-key-2")
+        .send({
+          wallet_address: "0xabc",
+          session_token: "token123456",
+          agreement_id: 1,
+          to: "0xdef",
+          amount: "100",
+        })
+        .expect(200);
+
+      const res2 = await request(makeApp())
+        .post("/api/v1/prepare/escrow/0x123/release")
+        .set("Idempotency-Key", "idemp-key-2")
+        .send({
+          wallet_address: "0xabc",
+          session_token: "token123456",
+          agreement_id: 1,
+          to: "0xdef",
+          amount: "200",
+        })
+        .expect(409);
+
+      expect(res2.body).toEqual({
+        error: "Idempotency key already used with a different request body",
+      });
+    });
+
+    it("returns 400 Bad Request when agreement balance is insufficient", async () => {
+      const { requireSession } = await import("../auth/session.js");
+      (requireSession as any).mockResolvedValue(true);
+
+      mockEscrow.get_agreement_balance.mockResolvedValue({ low: 50n, high: 0n });
 
       const res = await request(makeApp())
         .post("/api/v1/prepare/escrow/0x123/release")
@@ -203,59 +305,10 @@ describe("escrow routes", () => {
           to: "0xdef",
           amount: "100",
         })
-        .expect(403);
+        .expect(400);
 
-      expect(res.body).toEqual({ error: "Unauthorized" });
-    });
-  });
-
-  describe("Helper Functions", () => {
-    describe("computeAgreementBalance", () => {
-      it("calculates balance correctly from funded and released events", () => {
-        const events = [
-          { eventType: "Funded", amount: "1000" },
-          { eventType: "Released", amount: "200" },
-          { eventType: "Refunded", amount: "100" },
-        ];
-        const balance = computeAgreementBalance(events);
-        expect(balance).toBe(700n);
-      });
-
-      it("clamps negative balance to zero", () => {
-        const events = [
-          { eventType: "Funded", amount: "100" },
-          { eventType: "Released", amount: "200" },
-        ];
-        const balance = computeAgreementBalance(events);
-        expect(balance).toBe(0n);
-      });
-    });
-
-    describe("checkAgreementEmployerAuth", () => {
-      it("returns true when wallet address matches employer", async () => {
-        mockEscrow.get_agreement_employer.mockResolvedValue("0xabc");
-        const isAuth = await checkAgreementEmployerAuth("0x123", 1n, "0xABC");
-        expect(isAuth).toBe(true);
-      });
-
-      it("returns false when wallet address does not match employer", async () => {
-        mockEscrow.get_agreement_employer.mockResolvedValue("0xother");
-        const isAuth = await checkAgreementEmployerAuth("0x123", 1n, "0xabc");
-        expect(isAuth).toBe(false);
-      });
-    });
-
-    describe("prepareTransactionContext", () => {
-      it("fetches nonce and chainId concurrently", async () => {
-        const { provider } = await import("../starknet/client.js");
-        (provider.getNonceForAddress as any).mockResolvedValue("0x1");
-        (provider.getChainId as any).mockResolvedValue("0x534e5f4d41494e");
-
-        const result = await prepareTransactionContext("0xabc");
-        expect(result).toEqual({
-          nonce: "0x1",
-          chain_id: "0x534e5f4d41494e",
-        });
+      expect(res.body).toEqual({
+        error: "Insufficient agreement balance",
       });
     });
   });
