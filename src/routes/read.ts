@@ -219,7 +219,7 @@ readRouter.get("/token/:token/balance/:owner", async (req, res, next) => {
   try {
     const token = AddressParam.parse(req.params.token);
     const owner = AddressParam.parse(req.params.owner);
-    const balance = await erc20BalanceOf(token, owner, res.locals.requestId);
+    const balance = await erc20BalanceOf(token, owner);
     res.json({ token, owner, balance });
   } catch (e) {
     next(e);

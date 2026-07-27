@@ -8,7 +8,7 @@ import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { processTxReceipt, normalizeTransactionHash, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
 import fs from "fs";
 import path from "path";
