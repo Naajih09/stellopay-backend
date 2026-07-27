@@ -3,10 +3,49 @@ import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, gte, lte, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
-import { formatTokenAmount, DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
+import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
 
 export const analyticsRouter = Router();
+
+// ---------------------------------------------------------------------------
+// Constants (hoisted to avoid per-request allocation)
+// ---------------------------------------------------------------------------
+
+const MONTH_NAMES = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sept",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+const DISPLAY_DIVISOR = 10n ** BigInt(DEFAULT_TOKEN_DECIMALS);
+
+/**
+ * Convert a raw BigInt amount to a display number by performing BigInt division
+ * first (lossless) and then converting the integer and fractional parts
+ * separately. This avoids calling `formatTokenAmount` 13 times per request,
+ * each of which recomputes the divisor and rebuilds a formatted string.
+ */
+function toDisplayNumber(value: bigint): number {
+  const sign = value < 0n ? -1 : 1;
+  const abs = sign < 0 ? -value : value;
+  const whole = Number(abs / DISPLAY_DIVISOR);
+  const fraction = Number(abs % DISPLAY_DIVISOR);
+  return sign * (whole + fraction / Number(DISPLAY_DIVISOR));
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
 
 interface AnalyticsTelemetryEntry {
   operation: string;
@@ -42,9 +81,7 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
       console.info(JSON.stringify(logEntry));
     }
   } else {
-    const counts = logEntry.row_counts
-      ? ` rows=${JSON.stringify(logEntry.row_counts)}`
-      : "";
+    const counts = logEntry.row_counts ? ` rows=${JSON.stringify(logEntry.row_counts)}` : "";
     const msg =
       `[${logEntry.timestamp}] ${logEntry.level.toUpperCase()} [analytics-telemetry] ` +
       `${logEntry.operation} ${logEntry.status} ${logEntry.duration_ms}ms` +
@@ -157,49 +194,48 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
             eq(schema.escrowEvents.employer, userAddress),
             eq(schema.escrowEvents.to, userAddress),
           ),
-          gte(schema.escrowEvents.createdAt, startDate),
-          lte(schema.escrowEvents.createdAt, endDate),
         ),
-      );
 
-    // Get agreement creation events (for analytics - count agreements created per month)
-    const agreementCreations = await db
-      .select({
-        month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
-        agreementId: schema.agreementEvents.agreementId,
-      })
-      .from(schema.agreementEvents)
-      .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-      .where(
-        and(
-          eq(schema.agreementEvents.eventType, "AgreementCreated"),
-          or(
-            eq(schema.agreements.employer, userAddress),
-            eq(schema.agreements.contributor, userAddress),
+      db
+        .select({
+          month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
+          amount: schema.escrowEvents.amount,
+          eventType: schema.escrowEvents.eventType,
+        })
+        .from(schema.escrowEvents)
+        .where(
+          and(
+            or(
+              eq(schema.escrowEvents.employer, userAddress),
+              eq(schema.escrowEvents.to, userAddress),
+            ),
+            gte(schema.escrowEvents.createdAt, startDate),
+            lte(schema.escrowEvents.createdAt, endDate),
           ),
-          gte(schema.agreementEvents.createdAt, startDate),
-          lte(schema.agreementEvents.createdAt, endDate),
         ),
-      );
+
+      db
+        .select({
+          month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
+          agreementId: schema.agreementEvents.agreementId,
+        })
+        .from(schema.agreementEvents)
+        .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
+        .where(
+          and(
+            eq(schema.agreementEvents.eventType, "AgreementCreated"),
+            or(
+              eq(schema.agreements.employer, userAddress),
+              eq(schema.agreements.contributor, userAddress),
+            ),
+            gte(schema.agreementEvents.createdAt, startDate),
+            lte(schema.agreementEvents.createdAt, endDate),
+          ),
+        ),
+    ]);
 
     // Aggregate by month
     const monthlyData: Record<number, bigint> = {};
-    const monthNames = [
-      "Jan",
-      "Feb",
-      "Mar",
-      "Apr",
-      "May",
-      "Jun",
-      "Jul",
-      "Aug",
-      "Sept",
-      "Oct",
-      "Nov",
-      "Dec",
-    ];
-
-    // Initialize all months to 0
     for (let i = 1; i <= 12; i++) {
       monthlyData[i] = 0n;
     }
@@ -260,19 +296,12 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       });
     }
 
-    // Convert to chart format. Monthly amounts are u256 base units summed in
-    // BigInt space, so they can exceed Number.MAX_SAFE_INTEGER. Divide
-    // losslessly with formatTokenAmount before exposing the numeric display
-    // value the chart expects. Amounts are aggregated across tokens, so the
-    // 6-decimal USDC/USDT default is assumed here (DEFAULT_TOKEN_DECIMALS);
-    // a token-specific override would require per-token aggregation.
-    const chartData = monthNames.map((month, index) => {
+    // Convert to chart format using the precomputed divisor instead of calling
+    // formatTokenAmount 13 times (each call recomputes the BigInt exponent).
+    const chartData = MONTH_NAMES.map((month, index) => {
       const monthNum = index + 1;
       const value = monthlyData[monthNum] || 0n;
-      return {
-        month,
-        views: Number(formatTokenAmount(value, DEFAULT_TOKEN_DECIMALS)),
-      };
+      return { month, views: toDisplayNumber(value) };
     });
 
     // Sum the raw BigInt amounts before formatting so the total is computed
@@ -297,7 +326,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     res.json({
       year,
       data: chartData,
-      total: Number(formatTokenAmount(totalRaw, DEFAULT_TOKEN_DECIMALS)),
+      total: toDisplayNumber(totalRaw),
     });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;

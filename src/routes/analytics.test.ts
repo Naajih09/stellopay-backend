@@ -233,7 +233,11 @@ describe("analytics telemetry and error logs", () => {
     expect(infoSpy).toHaveBeenCalled();
     const parsed = infoSpy.mock.calls
       .map((call) => {
-        try { return JSON.parse(call[0] as string); } catch { return null; }
+        try {
+          return JSON.parse(call[0] as string);
+        } catch {
+          return null;
+        }
       })
       .find((l) => l?.operation === "analytics_monthly_rollup");
 
@@ -259,7 +263,11 @@ describe("analytics telemetry and error logs", () => {
     expect(errorSpy).toHaveBeenCalled();
     const parsed = errorSpy.mock.calls
       .map((call) => {
-        try { return JSON.parse(call[0] as string); } catch { return null; }
+        try {
+          return JSON.parse(call[0] as string);
+        } catch {
+          return null;
+        }
       })
       .find((l) => l?.operation === "analytics_monthly_rollup");
 
