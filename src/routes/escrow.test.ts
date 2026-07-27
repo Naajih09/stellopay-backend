@@ -177,6 +177,7 @@ describe("escrow routes", () => {
       (requireSession as any).mockResolvedValue(true);
 
       mockEscrow.populate.mockReturnValue({ contractAddress: "0x123", entrypoint: "release", calldata: [] });
+      mockEscrow.get_agreement_employer.mockResolvedValue("0xabc");
       const { provider } = await import("../starknet/client.js");
       (provider.getNonceForAddress as any).mockResolvedValue("0x1");
       (provider.getChainId as any).mockResolvedValue("0x534e5f4d41494e"); // SN_MAIN
@@ -312,3 +313,4 @@ describe("escrow routes", () => {
     });
   });
 });
+

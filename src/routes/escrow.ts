@@ -308,9 +308,8 @@ escrowRouter.post("/prepare/escrow/:address/initialize", async (req, res, next) 
 
     const c = escrowContract(address);
     const call = c.populate("initialize", [body.token, body.manager]);
-    const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
-    const chainId = await provider.getChainId();
-    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id: chainId });
+    const { nonce, chain_id } = await prepareTransactionContext(body.wallet_address);
+    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id });
   } catch (e) {
     next(e);
   }
@@ -331,9 +330,8 @@ escrowRouter.post("/prepare/escrow/:address/fund_agreement", async (req, res, ne
       body.employer,
       parseU256(body.amount),
     ]);
-    const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
-    const chainId = await provider.getChainId();
-    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id: chainId });
+    const { nonce, chain_id } = await prepareTransactionContext(body.wallet_address);
+    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id });
   } catch (e) {
     next(e);
   }
@@ -362,9 +360,8 @@ escrowRouter.post("/prepare/escrow/:address/release", withEscrowIdempotency(asyn
       body.to,
       parseU256(body.amount),
     ]);
-    const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
-    const chainId = await provider.getChainId();
-    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id: chainId });
+    const { nonce, chain_id } = await prepareTransactionContext(body.wallet_address);
+    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id });
   } catch (e) {
     next(e);
   }
@@ -379,11 +376,16 @@ escrowRouter.post("/prepare/escrow/:address/refund_remaining", async (req, res, 
       return;
     }
 
+    const isAuth = await checkAgreementEmployerAuth(address, body.agreement_id, body.wallet_address);
+    if (!isAuth) {
+      res.status(403).json({ error: "Unauthorized" });
+      return;
+    }
+
     const c = escrowContract(address);
     const call = c.populate("refund_remaining", [body.agreement_id.toString()]);
-    const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
-    const chainId = await provider.getChainId();
-    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id: chainId });
+    const { nonce, chain_id } = await prepareTransactionContext(body.wallet_address);
+    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id });
   } catch (e) {
     next(e);
   }

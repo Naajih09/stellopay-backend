@@ -31,9 +31,11 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
 | `Authorization` | String | Format: `Bearer <session_token>` | Yes |
 
 #### Request Parameters
-- **Query Parameters**: None.
+- **Query Parameters**:
+  - `limit` (Optional, Integer): The maximum number of recent events to return. Defaults to `20`. Hard-capped at `100`.
+  - `offset` (Optional, Integer): The number of recent events to skip. Defaults to `0`.
 - **Body**: None.
-- Every query is parameter-free and static, ensuring zero SQL injection exposure.
+- Every query is strictly parameterized or uses parsed integers, ensuring zero SQL injection exposure.
 
 #### Success Response (`200 OK`)
 

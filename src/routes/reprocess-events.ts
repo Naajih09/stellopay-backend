@@ -300,12 +300,12 @@ reprocessEventsRouter.post(
         try {
           const receipt = await provider.getTransactionReceipt(event.transactionHash);
           if (!receipt || !("events" in receipt && receipt.events)) {
-            results.push({ eventId: event.id, status: "no_receipt" });
+            handleFailure("no_receipt");
             continue;
           }
           const receiptEvent = receipt.events[event.eventIndex];
           if (!receiptEvent) {
-            results.push({ eventId: event.id, status: "event_not_found" });
+            handleFailure("event_not_found");
             continue;
           }
           const fromAddress = receiptEvent.from_address?.toLowerCase() || "";
@@ -350,10 +350,10 @@ reprocessEventsRouter.post(
             updated++;
             results.push({ eventId: event.id, status: "updated", oldType: "AgreementStatusChange", newType: eventType });
           } else {
-            results.push({ eventId: event.id, status: "no_change", eventType });
+            handleFailure("no_change");
           }
         } catch (e) {
-          results.push({ eventId: event.id, status: "error", error: String(e) });
+          handleFailure("error", String(e));
         }
       }
 
